@@ -1,10 +1,7 @@
 import datetime
 import re
-import time
 
 import lxml.html
-import requests
-import scrapelib
 
 from openstates.scrape import Scraper, VoteEvent
 
@@ -36,10 +33,14 @@ class KSVoteScraper(Scraper):
             # Paginate until no vote rows are returned.
             list_url = (
                 f"{self.BASE_URL}/{biennium}/votes/fragment/"
-                f"?page={page}&per_page=20"
+                f"?page={page}&per_page=100"
             )
 
-            response = self.get(list_url)
+            try:
+                response = self.get(list_url)
+            except Exception as e:
+                self.warning(f"Failed to fetch vote listing page {page}: {e}")
+                break
 
             doc = lxml.html.fromstring(response.text)
 
@@ -57,48 +58,25 @@ class KSVoteScraper(Scraper):
                 if not vote_url.startswith("http"):
                     vote_url = f"{self.BASE_URL}{vote_url}"
 
-                yield from self.parse_vote(
-                    bill,
-                    vote_url,
-                    session,
-                )
+                yield from self.parse_vote(bill, vote_url, session)
 
-            # Past the last page the site keeps returning the last page's
-            # rows, so stop when there is no link to the next page.
-            if not doc.xpath(f'//a[contains(@hx-get, "?page={page + 1}&")]'):
+            # The KS site returns the last page's rows again for any page
+            # number beyond the last real page, so we can't rely on an empty
+            # response to stop. Stop as soon as there is no link to the next
+            # page in the listing HTML.
+            next_page_link = doc.xpath(f"//a[contains(@href,'?page={page + 1}&')]")
+            if not next_page_link:
                 break
 
             page += 1
 
     def parse_vote(self, bill, link, session):
-        response = None
-
-        # Kansas occasionally resets SSL connections while processing
-        # large numbers of requests. Retry before skipping a vote.
-        for attempt in range(10):
-            try:
-                response = self.get(
-                    link,
-                    timeout=60,
-                )
-                break
-
-            except scrapelib.HTTPError as e:
-                # a 404 or a 5xx scrapelib already retried won't come good
-                self.warning(f"Skipping vote: {e}")
-                return
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as e:
-                self.warning(f"Attempt {attempt + 1}/10 failed for {link}: {e}")
-                time.sleep(10)
-
-        if response is None:
-            self.warning(f"Skipping vote after repeated failures: {link}")
+        try:
+            response = self.get(link, timeout=60)
+            text = response.text
+        except Exception as e:
+            self.warning(f"Skipping vote after repeated failures: {link}: {e}")
             return
-
-        text = response.text
 
         if "Page Not Found" in text or "Page Unavailable" in text:
             self.warning(f"Missing vote page: {link}")
@@ -110,18 +88,16 @@ class KSVoteScraper(Scraper):
 
         doc = lxml.html.fromstring(text)
 
-        # The motion ("Motion to advance to Emergency Final Action failed;")
-        # is the hero's "list-hero-sub" paragraph; the short-title span holds
-        # the bill's title.
-        motion_text = (
-            doc.xpath("string(//p[contains(@class,'list-hero-sub')])")
-            .strip()
-            .rstrip(";")
-        )
+        # The motion/short title lives in the vote hero's short-title span.
+        # Older/alternate layouts used a "list-hero-sub" paragraph, so fall
+        # back to that when the primary element is absent.
+        motion_text = doc.xpath(
+            "string(//span[contains(@class,'vote-hero-shorttitle')])"
+        ).strip()
 
         if not motion_text:
             motion_text = doc.xpath(
-                "string(//span[contains(@class,'vote-hero-shorttitle')])"
+                "string(//p[contains(@class,'list-hero-sub')])"
             ).strip()
 
         # Fall back to the roll call heading so votes are never emitted with
@@ -205,12 +181,7 @@ class KSVoteScraper(Scraper):
             chamber=chamber,
             motion_text=motion_text,
             legislative_session=session,
-            result=(
-                "fail"
-                if re.search(r"\bfailed\b", motion_text, re.IGNORECASE)
-                or yes_count <= no_count
-                else "pass"
-            ),
+            result="pass" if yes_count > no_count else "fail",
             classification="passage",
         )
 
