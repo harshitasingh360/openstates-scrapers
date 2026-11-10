@@ -1,4 +1,5 @@
 import re
+import time
 
 import dateutil
 import json
@@ -7,6 +8,8 @@ import os
 import pytz
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from openstates.scrape import Scraper, Bill, VoteEvent
 from .actions import Categorizer
@@ -16,6 +19,48 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 four_digit_regex = re.compile("[0-9]{4}")
 
 
+def _make_retry_session() -> requests.Session:
+    """Return a requests.Session with retry/backoff for transient server errors."""
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _get_with_retry(session, url, max_attempts=5, backoff=2, **kwargs):
+    """GET with manual retry for SSLError/EOF which urllib3 Retry doesn't catch."""
+    for attempt in range(max_attempts):
+        try:
+            return session.get(url, **kwargs)
+        except requests.exceptions.SSLError as e:
+            if attempt < max_attempts - 1:
+                wait = backoff ** attempt
+                time.sleep(wait)
+            else:
+                raise
+
+
+def _post_with_retry(session, url, max_attempts=5, backoff=2, **kwargs):
+    """POST with manual retry for SSLError/EOF which urllib3 Retry doesn't catch."""
+    for attempt in range(max_attempts):
+        try:
+            return session.post(url, **kwargs)
+        except requests.exceptions.SSLError as e:
+            if attempt < max_attempts - 1:
+                wait = backoff ** attempt
+                time.sleep(wait)
+            else:
+                raise
+
+
 class VaBillScraper(Scraper):
     tz = pytz.timezone("America/New_York")
     headers: object = {}
@@ -23,6 +68,13 @@ class VaBillScraper(Scraper):
     session_code: str = ""
     categorizer = Categorizer()
     verify = False
+    _session: requests.Session = None
+
+    @property
+    def req_session(self) -> requests.Session:
+        if self._session is None:
+            self._session = _make_retry_session()
+        return self._session
 
     chamber_map = {
         "S": "upper",
@@ -65,7 +117,8 @@ class VaBillScraper(Scraper):
         # If we don't IncludeFailed, we will only get a subset of legislation
         body = {"SessionCode": self.session_code, "IncludeFailed": True}
 
-        page = requests.post(
+        page = _post_with_retry(
+            self.req_session,
             f"{self.base_url}/Legislation/api/getlegislationlistasync",
             headers=self.headers,
             json=body,
@@ -135,7 +188,8 @@ class VaBillScraper(Scraper):
             "legislationID": legislation_id,
         }
 
-        page = requests.get(
+        page = _get_with_retry(
+            self.req_session,
             f"{self.base_url}/LegislationEvent/api/getlegislationeventbylegislationidasync",
             params=body,
             headers=self.headers,
@@ -200,7 +254,8 @@ class VaBillScraper(Scraper):
             bill.add_related_bill(bill.identifier, f"{prior_session}", "prior-session")
 
     def add_sponsors(self, bill: Bill, legislation_id: str):
-        page = requests.get(
+        page = _get_with_retry(
+            self.req_session,
             f"{self.base_url}/LegislationPatron/api/GetLegislationPatronsByIdAsync/{legislation_id}",
             headers=self.headers,
             verify=False,
@@ -221,7 +276,8 @@ class VaBillScraper(Scraper):
             "sessionCode": self.session_code,
             "legislationID": legislation_id,
         }
-        response = requests.get(
+        response = _get_with_retry(
+            self.req_session,
             f"{self.base_url}/LegislationText/api/getlegislationtextbyidasync",
             params=body,
             headers=self.headers,
@@ -276,7 +332,8 @@ class VaBillScraper(Scraper):
         }
 
         vote_page_url = f"{self.base_url}/Vote/api/getvotebyidasync"
-        page = requests.get(
+        page = _get_with_retry(
+            self.req_session,
             vote_page_url,
             params=body,
             headers=self.headers,
